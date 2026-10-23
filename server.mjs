@@ -16,18 +16,18 @@ const port = Number(process.env.PORT || 8787);
 const appUrl = process.env.PUBLIC_APP_URL || 'http://localhost:5173';
 const apiUrl = process.env.PUBLIC_API_URL || `http://localhost:${port}`;
 const plans = {
-  Monthly: Number(process.env.PLAN_MONTHLY_AMOUNT_CENTS || 9000),
-  '3 months': Number(process.env.PLAN_3_MONTHS_AMOUNT_CENTS || 19000),
-  '6 months': Number(process.env.PLAN_6_MONTHS_AMOUNT_CENTS || 38000),
-  Yearly: Number(process.env.PLAN_YEARLY_AMOUNT_CENTS || 65000),
+  Monthly: Number(process.env.PLAN_MONTHLY_AMOUNT_KOBO || 9000000),
+  '3 months': Number(process.env.PLAN_3_MONTHS_AMOUNT_KOBO || 19000000),
+  '6 months': Number(process.env.PLAN_6_MONTHS_AMOUNT_KOBO || 38000000),
+  Yearly: Number(process.env.PLAN_YEARLY_AMOUNT_KOBO || 65000000),
 };
 
 const missingConfig = [
   !process.env.PAYSTACK_SECRET_KEY && 'PAYSTACK_SECRET_KEY',
-  !plans.Monthly && 'PLAN_MONTHLY_AMOUNT_CENTS',
-  !plans['3 months'] && 'PLAN_3_MONTHS_AMOUNT_CENTS',
-  !plans['6 months'] && 'PLAN_6_MONTHS_AMOUNT_CENTS',
-  !plans.Yearly && 'PLAN_YEARLY_AMOUNT_CENTS',
+  !plans.Monthly && 'PLAN_MONTHLY_AMOUNT_KOBO',
+  !plans['3 months'] && 'PLAN_3_MONTHS_AMOUNT_KOBO',
+  !plans['6 months'] && 'PLAN_6_MONTHS_AMOUNT_KOBO',
+  !plans.Yearly && 'PLAN_YEARLY_AMOUNT_KOBO',
 ].filter(Boolean);
 
 const json = file => JSON.parse(readFileSync(file, 'utf8'));
@@ -63,9 +63,9 @@ async function initializePayment(input) {
   const reference = `TNT_${Date.now()}_${randomBytes(4).toString('hex')}`;
   let result;
   if (provider === 'paystack') {
-    result = await providerRequest(provider, '/transaction/initialize', { method: 'POST', body: JSON.stringify({ email, amount: amountKobo, currency: 'USD', reference, callback_url: `${apiUrl}/api/payments/callback?provider=paystack&reference=${reference}`, metadata: { plan } }) });
+    result = await providerRequest(provider, '/transaction/initialize', { method: 'POST', body: JSON.stringify({ email, amount: amountKobo, currency: 'NGN', reference, callback_url: `${apiUrl}/api/payments/callback?provider=paystack&reference=${reference}`, metadata: { plan } }) });
   } else {
-    result = await providerRequest(provider, '/payments', { method: 'POST', body: JSON.stringify({ tx_ref: reference, amount: amountKobo / 100, currency: 'USD', redirect_url: `${apiUrl}/api/payments/callback?provider=flutterwave`, payment_options: 'card,banktransfer,ussd', customer: { email }, meta: { plan } }) });
+    result = await providerRequest(provider, '/payments', { method: 'POST', body: JSON.stringify({ tx_ref: reference, amount: amountKobo / 100, currency: 'NGN', redirect_url: `${apiUrl}/api/payments/callback?provider=flutterwave`, payment_options: 'card,banktransfer,ussd', customer: { email }, meta: { plan } }) });
   }
   const payments = json(paymentsFile);
   payments.push({ provider, plan, email, reference, amountKobo, status: 'pending', createdAt: new Date().toISOString() });
@@ -86,11 +86,11 @@ async function verifyPayment(provider, reference, transactionId) {
     ? result.data.status === 'success'
       && result.data.reference === reference
       && result.data.amount === payment.amountKobo
-      && result.data.currency === 'USD'
+      && result.data.currency === 'NGN'
     : result.data.status === 'successful'
       && result.data.tx_ref === reference
       && Number(result.data.amount) === payment.amountKobo / 100
-      && result.data.currency === 'USD';
+      && result.data.currency === 'NGN';
   if (!paid) throw new Error('Payment has not been confirmed');
   if (payment.status !== 'paid') { payment.status = 'paid'; payment.accessCode = payment.accessCode || makeCode(); payment.paidAt = new Date().toISOString(); save(paymentsFile, payments); }
   return payment;
