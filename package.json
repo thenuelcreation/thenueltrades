@@ -1,0 +1,10 @@
+{
+  "name": "thenueltrades-academy",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": { "dev": "vite", "build": "vite build", "preview": "vite preview", "backend": "node --env-file-if-exists=.env server.mjs" },
+  "dependencies": { "react": "latest", "react-dom": "latest", "lucide-react": "latest" },
+  "devDependencies": { "vite": "latest", "@vitejs/plugin-react": "latest" },
+  "description": "ThenuelTrades Academy React dashboard"
+}
