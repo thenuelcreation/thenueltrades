@@ -64,6 +64,11 @@ async function findPayment(provider, reference) {
   if (pool) return paymentFromRow((await pool.query('SELECT * FROM payments WHERE provider = $1 AND reference = $2', [provider, reference])).rows[0]);
   return json(paymentsFile).find(item => item.reference === reference && item.provider === provider) || null;
 }
+async function findAvailablePaymentByCode(accessCode) {
+  const normalizedCode = accessCode.trim().toUpperCase();
+  if (pool) return paymentFromRow((await pool.query('SELECT * FROM payments WHERE access_code = $1 AND status = $2 AND code_used_at IS NULL', [normalizedCode, 'paid'])).rows[0]);
+  return json(paymentsFile).find(item => item.accessCode === normalizedCode && item.status === 'paid' && !item.codeUsedAt) || null;
+}
 async function insertPayment(payment) {
   if (pool) { await pool.query('INSERT INTO payments (provider, plan, email, reference, amount_kobo, status) VALUES ($1, $2, $3, $4, $5, $6)', [payment.provider, payment.plan, payment.email, payment.reference, payment.amountKobo, payment.status]); return; }
   const payments = json(paymentsFile); payments.push(payment); save(paymentsFile, payments);
@@ -162,7 +167,7 @@ async function handle(req, res) {
     }
     if (req.method === 'POST' && req.url === '/api/accounts') {
       const input = await body(req); if (!input.name || !input.username || !input.email || !input.password || !input.accessCode) throw new Error('All account fields are required');
-      const payments = json(paymentsFile); const payment = payments.find(item => item.accessCode === input.accessCode && item.status === 'paid' && !item.codeUsedAt); if (!payment) throw new Error('Invalid or already-used membership access code');
+      const payment = await findAvailablePaymentByCode(input.accessCode); if (!payment) throw new Error('Invalid or already-used membership access code');
       const email = input.email.trim().toLowerCase(); const username = input.username.trim().toLowerCase(); if (pool) { const existing = await pool.query('SELECT 1 FROM accounts WHERE username = $1 OR email = $2', [username, email]); if (existing.rowCount) throw new Error('Username or email already exists'); await pool.query('INSERT INTO accounts (name, username, email, password_hash, plan) VALUES ($1, $2, $3, $4, $5)', [input.name.trim(), username, email, hashPassword(input.password), payment.plan]); await pool.query('UPDATE payments SET code_used_at = NOW() WHERE provider = $1 AND reference = $2', [payment.provider, payment.reference]); } else { const accounts = json(accountsFile); if (accounts.some(account => account.username === username || account.email === email)) throw new Error('Username or email already exists'); accounts.push({ name: input.name.trim(), username, email, passwordHash: hashPassword(input.password), plan: payment.plan, createdAt: new Date().toISOString() }); payment.codeUsedAt = new Date().toISOString(); const payments = json(paymentsFile); const stored = payments.find(item => item.reference === payment.reference && item.provider === payment.provider); stored.codeUsedAt = payment.codeUsedAt; save(accountsFile, accounts); save(paymentsFile, payments); } return send(res, 201, { ok: true });
     }
     if (req.method === 'GET' && req.url?.startsWith('/api/payments/callback')) {
