@@ -3,6 +3,8 @@ import { createHmac, randomBytes, scryptSync, timingSafeEqual } from 'node:crypt
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import pg from 'pg';
+const { Pool } = pg;
 
 const root = dirname(fileURLToPath(import.meta.url));
 const dataDir = join(root, 'data');
@@ -13,12 +15,13 @@ mkdirSync(dataDir, { recursive: true });
 if (!existsSync(paymentsFile)) writeFileSync(paymentsFile, '[]');
 if (!existsSync(accountsFile)) writeFileSync(accountsFile, '[]');
 if (!existsSync(sessionsFile)) writeFileSync(sessionsFile, '[]');
+const pool = process.env.DATABASE_URL ? new Pool({ connectionString: process.env.DATABASE_URL, ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : undefined }) : null;
 
 const port = Number(process.env.PORT || 8787);
 const appUrl = process.env.PUBLIC_APP_URL || 'http://localhost:5173';
 const apiUrl = process.env.PUBLIC_API_URL || `http://localhost:${port}`;
 const plans = {
-  Monthly: Number(process.env.PLAN_MONTHLY_AMOUNT_KOBO || 9000000),
+  Monthly: Number(process.env.PLAN_MONTHLY_AMOUNT_KOBO || 50000),
   '3 months': Number(process.env.PLAN_3_MONTHS_AMOUNT_KOBO || 19000000),
   '6 months': Number(process.env.PLAN_6_MONTHS_AMOUNT_KOBO || 38000000),
   Yearly: Number(process.env.PLAN_YEARLY_AMOUNT_KOBO || 65000000),
@@ -44,8 +47,39 @@ const verifyPassword = (password, stored) => { const [salt, hash] = stored.split
 const cookieValue = (req, name) => (req.headers.cookie || '').split(';').map(item => item.trim().split('=')).find(([key]) => key === name)?.[1];
 const cookieAttributes = appUrl.startsWith('https://') ? 'HttpOnly; SameSite=None; Secure; ' : 'HttpOnly; SameSite=Lax; ';
 const sessionCookie = token => `${token}; ${cookieAttributes}Path=/; Max-Age=604800`;
-const accountForRequest = req => { const token = cookieValue(req, 'tnt_session'); if (!token) return null; const sessions = json(sessionsFile); const session = sessions.find(item => item.token === token && Date.parse(item.expiresAt) > Date.now()); if (!session) return null; return json(accountsFile).find(account => account.email === session.email) || null; };
 const authError = message => Object.assign(new Error(message), { status: 401 });
+
+async function initDatabase() {
+  if (!pool) return;
+  await pool.query(`CREATE TABLE IF NOT EXISTS payments (id BIGSERIAL PRIMARY KEY, provider TEXT NOT NULL, plan TEXT NOT NULL, email TEXT NOT NULL, reference TEXT UNIQUE NOT NULL, amount_kobo BIGINT NOT NULL, status TEXT NOT NULL, access_code TEXT UNIQUE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), paid_at TIMESTAMPTZ, code_used_at TIMESTAMPTZ)`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS accounts (id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL, username TEXT UNIQUE NOT NULL, email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, plan TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, email TEXT NOT NULL, expires_at TIMESTAMPTZ NOT NULL)`);
+}
+
+const paymentFromRow = row => row && ({ provider: row.provider, plan: row.plan, email: row.email, reference: row.reference, amountKobo: Number(row.amount_kobo), status: row.status, accessCode: row.access_code, createdAt: row.created_at, paidAt: row.paid_at, codeUsedAt: row.code_used_at });
+const accountFromRow = row => row && ({ name: row.name, username: row.username, email: row.email, passwordHash: row.password_hash, plan: row.plan, createdAt: row.created_at });
+const accountForResponse = account => ({ name: account.name, username: account.username, email: account.email, plan: account.plan });
+
+async function findPayment(provider, reference) {
+  if (pool) return paymentFromRow((await pool.query('SELECT * FROM payments WHERE provider = $1 AND reference = $2', [provider, reference])).rows[0]);
+  return json(paymentsFile).find(item => item.reference === reference && item.provider === provider) || null;
+}
+async function insertPayment(payment) {
+  if (pool) { await pool.query('INSERT INTO payments (provider, plan, email, reference, amount_kobo, status) VALUES ($1, $2, $3, $4, $5, $6)', [payment.provider, payment.plan, payment.email, payment.reference, payment.amountKobo, payment.status]); return; }
+  const payments = json(paymentsFile); payments.push(payment); save(paymentsFile, payments);
+}
+async function markPaymentPaid(payment) {
+  if (payment.status === 'paid') return payment;
+  const accessCode = payment.accessCode || makeCode(); const paidAt = new Date().toISOString();
+  if (pool) await pool.query('UPDATE payments SET status = $1, access_code = $2, paid_at = $3 WHERE provider = $4 AND reference = $5', ['paid', accessCode, paidAt, payment.provider, payment.reference]);
+  else { const payments = json(paymentsFile); const stored = payments.find(item => item.reference === payment.reference && item.provider === payment.provider); stored.status = 'paid'; stored.accessCode = accessCode; stored.paidAt = paidAt; save(paymentsFile, payments); }
+  return { ...payment, status: 'paid', accessCode, paidAt };
+}
+async function accountForRequest(req) {
+  const token = cookieValue(req, 'tnt_session'); if (!token) return null;
+  if (pool) return accountFromRow((await pool.query('SELECT a.* FROM accounts a JOIN sessions s ON s.email = a.email WHERE s.token = $1 AND s.expires_at > NOW()', [token])).rows[0]);
+  const session = json(sessionsFile).find(item => item.token === token && Date.parse(item.expiresAt) > Date.now()); if (!session) return null; return json(accountsFile).find(account => account.email === session.email) || null;
+}
 const api = (provider) => provider === 'paystack' ? 'https://api.paystack.co' : 'https://api.flutterwave.com/v3';
 const headers = provider => ({ Authorization: `Bearer ${secret(provider)}`, 'content-type': 'application/json' });
 
@@ -74,17 +108,14 @@ async function initializePayment(input) {
   } else {
     result = await providerRequest(provider, '/payments', { method: 'POST', body: JSON.stringify({ tx_ref: reference, amount: amountKobo / 100, currency: 'NGN', redirect_url: `${apiUrl}/api/payments/callback?provider=flutterwave`, payment_options: 'card,banktransfer,ussd', customer: { email }, meta: { plan } }) });
   }
-  const payments = json(paymentsFile);
-  payments.push({ provider, plan, email, reference, amountKobo, status: 'pending', createdAt: new Date().toISOString() });
-  save(paymentsFile, payments);
+  await insertPayment({ provider, plan, email: email.trim().toLowerCase(), reference, amountKobo, status: 'pending', createdAt: new Date().toISOString() });
   const checkoutUrl = provider === 'paystack' ? result.data.authorization_url : result.data.link;
   return { checkoutUrl, reference };
 }
 
 async function verifyPayment(provider, reference, transactionId) {
   requireProvider(provider);
-  const payments = json(paymentsFile);
-  const payment = payments.find(item => item.reference === reference && item.provider === provider);
+  const payment = await findPayment(provider, reference);
   if (!payment) throw new Error('Payment reference was not found');
   const result = provider === 'paystack'
     ? await providerRequest(provider, `/transaction/verify/${encodeURIComponent(reference)}`)
@@ -99,8 +130,7 @@ async function verifyPayment(provider, reference, transactionId) {
       && Number(result.data.amount) === payment.amountKobo / 100
       && result.data.currency === 'NGN';
   if (!paid) throw new Error('Payment has not been confirmed');
-  if (payment.status !== 'paid') { payment.status = 'paid'; payment.accessCode = payment.accessCode || makeCode(); payment.paidAt = new Date().toISOString(); save(paymentsFile, payments); }
-  return payment;
+  return markPaymentPaid(payment);
 }
 
 async function handle(req, res) {
@@ -117,24 +147,23 @@ async function handle(req, res) {
     if (req.method === 'POST' && req.url === '/api/auth/login') {
       const input = await body(req); const identifier = String(input.identifier || '').trim().toLowerCase(); const password = String(input.password || '');
       if (!identifier || !password) throw authError('Enter your username or email and password');
-      const accounts = json(accountsFile); const account = accounts.find(item => item.email.toLowerCase() === identifier || item.username.toLowerCase() === identifier);
+      const account = pool ? accountFromRow((await pool.query('SELECT * FROM accounts WHERE LOWER(email) = $1 OR LOWER(username) = $1', [identifier])).rows[0]) : json(accountsFile).find(item => item.email.toLowerCase() === identifier || item.username.toLowerCase() === identifier);
       if (!account || !verifyPassword(password, account.passwordHash)) throw authError('Invalid username/email or password');
-      const token = randomBytes(32).toString('hex'); const sessions = json(sessionsFile); sessions.push({ token, email: account.email, expiresAt: new Date(Date.now() + 604800000).toISOString() }); save(sessionsFile, sessions);
-      return send(res, 200, { ok: true, account: { name: account.name, username: account.username, email: account.email, plan: account.plan } }, { 'set-cookie': `tnt_session=${sessionCookie(token)}` });
+      const token = randomBytes(32).toString('hex'); const expiresAt = new Date(Date.now() + 604800000).toISOString(); if (pool) await pool.query('INSERT INTO sessions (token, email, expires_at) VALUES ($1, $2, $3)', [token, account.email, expiresAt]); else { const sessions = json(sessionsFile); sessions.push({ token, email: account.email, expiresAt }); save(sessionsFile, sessions); }
+      return send(res, 200, { ok: true, account: accountForResponse(account) }, { 'set-cookie': `tnt_session=${sessionCookie(token)}` });
     }
     if (req.method === 'GET' && req.url === '/api/auth/me') {
-      const account = accountForRequest(req); if (!account) throw authError('Authentication required');
-      return send(res, 200, { authenticated: true, account: { name: account.name, username: account.username, email: account.email, plan: account.plan } });
+      const account = await accountForRequest(req); if (!account) throw authError('Authentication required');
+      return send(res, 200, { authenticated: true, account: accountForResponse(account) });
     }
     if (req.method === 'POST' && req.url === '/api/auth/logout') {
-      const token = cookieValue(req, 'tnt_session'); const sessions = json(sessionsFile).filter(item => item.token !== token); save(sessionsFile, sessions);
+      const token = cookieValue(req, 'tnt_session'); if (pool) await pool.query('DELETE FROM sessions WHERE token = $1', [token]); else { const sessions = json(sessionsFile).filter(item => item.token !== token); save(sessionsFile, sessions); }
       return send(res, 200, { ok: true }, { 'set-cookie': `tnt_session=; ${cookieAttributes}Path=/; Max-Age=0` });
     }
     if (req.method === 'POST' && req.url === '/api/accounts') {
       const input = await body(req); if (!input.name || !input.username || !input.email || !input.password || !input.accessCode) throw new Error('All account fields are required');
       const payments = json(paymentsFile); const payment = payments.find(item => item.accessCode === input.accessCode && item.status === 'paid' && !item.codeUsedAt); if (!payment) throw new Error('Invalid or already-used membership access code');
-      const accounts = json(accountsFile); const email = input.email.trim().toLowerCase(); const username = input.username.trim().toLowerCase(); if (accounts.some(account => account.username === username || account.email === email)) throw new Error('Username or email already exists');
-      accounts.push({ name: input.name.trim(), username, email, passwordHash: hashPassword(input.password), plan: payment.plan, createdAt: new Date().toISOString() }); payment.codeUsedAt = new Date().toISOString(); save(accountsFile, accounts); save(paymentsFile, payments); return send(res, 201, { ok: true });
+      const email = input.email.trim().toLowerCase(); const username = input.username.trim().toLowerCase(); if (pool) { const existing = await pool.query('SELECT 1 FROM accounts WHERE username = $1 OR email = $2', [username, email]); if (existing.rowCount) throw new Error('Username or email already exists'); await pool.query('INSERT INTO accounts (name, username, email, password_hash, plan) VALUES ($1, $2, $3, $4, $5)', [input.name.trim(), username, email, hashPassword(input.password), payment.plan]); await pool.query('UPDATE payments SET code_used_at = NOW() WHERE provider = $1 AND reference = $2', [payment.provider, payment.reference]); } else { const accounts = json(accountsFile); if (accounts.some(account => account.username === username || account.email === email)) throw new Error('Username or email already exists'); accounts.push({ name: input.name.trim(), username, email, passwordHash: hashPassword(input.password), plan: payment.plan, createdAt: new Date().toISOString() }); payment.codeUsedAt = new Date().toISOString(); const payments = json(paymentsFile); const stored = payments.find(item => item.reference === payment.reference && item.provider === payment.provider); stored.codeUsedAt = payment.codeUsedAt; save(accountsFile, accounts); save(paymentsFile, payments); } return send(res, 201, { ok: true });
     }
     if (req.method === 'GET' && req.url?.startsWith('/api/payments/callback')) {
       const url = new URL(req.url, `http://${req.headers.host}`); const provider = url.searchParams.get('provider'); const reference = url.searchParams.get('reference') || url.searchParams.get('tx_ref'); const transactionId = url.searchParams.get('transaction_id'); const payment = await verifyPayment(provider, reference, transactionId); return res.writeHead(302, { location: `${appUrl}/#payment-success?code=${encodeURIComponent(payment.accessCode)}&plan=${encodeURIComponent(payment.plan)}` }).end();
@@ -143,8 +172,9 @@ async function handle(req, res) {
   } catch (error) { return send(res, error.status || 400, { error: error.message }); }
 }
 
-createServer(handle).listen(port, () => {
+initDatabase().then(() => createServer(handle).listen(port, () => {
   console.log(`Payment backend listening on http://localhost:${port}`);
+  console.log(`Storage: ${pool ? 'PostgreSQL' : 'local JSON fallback (set DATABASE_URL for production)'}`);
   if (missingConfig.length) console.warn(`Missing configuration: ${missingConfig.join(', ')}`);
   else console.log('Paystack and Flutterwave configuration loaded.');
-});
+})).catch(error => { console.error('Unable to initialize storage:', error); process.exit(1); });
